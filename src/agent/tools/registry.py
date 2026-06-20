@@ -90,6 +90,11 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolDefinition] = {}
+        self._session_cache: Dict[str, Any] = {}
+
+    def clear_session_cache(self) -> None:
+        """Clear the per-session tool result cache."""
+        self._session_cache.clear()
 
     # ----- Registration -----
 
@@ -146,13 +151,22 @@ class ToolRegistry:
         Raises ``KeyError`` if tool not found.
         Raises the handler's exception on execution failure.
 
-        Tool names must match the registry exactly.
+        Session-level dedup: same tool+args within one session returns
+        cached result instead of re-executing.
         """
         tool_def = self.resolve(name)
         if tool_def is None:
             raise KeyError(f"Tool '{name}' not found in registry. Available: {self.list_names()}")
 
-        return tool_def.handler(**kwargs)
+        # Session-level dedup cache
+        cache_key = f"{name}:{json.dumps(kwargs, sort_keys=True, default=str)}"
+        if cache_key in self._session_cache:
+            logger.info("Tool session cache HIT: %s", cache_key[:120])
+            return self._session_cache[cache_key]
+
+        result = tool_def.handler(**kwargs)
+        self._session_cache[cache_key] = result
+        return result
 
 
 # ============================================================

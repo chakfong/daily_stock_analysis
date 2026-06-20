@@ -68,12 +68,53 @@ def _persist_news_response(
         )
 
 
+def _load_cached_news(
+    stock_code: str, dimension: str, max_age_hours: int = 24,
+) -> Optional[dict]:
+    """Check DB for cached news matching dimension, return formatted result or None."""
+    try:
+        db = _get_db()
+        code = _canonical_search_code(stock_code)
+        records = db.get_recent_news_intel(code=code, dimension=dimension, max_age_hours=max_age_hours)
+        if records:
+            results = [
+                {
+                    "title": r.get("title", ""),
+                    "snippet": r.get("snippet", ""),
+                    "url": r.get("url", ""),
+                    "source": r.get("source", ""),
+                    "published_date": r.get("published_date", ""),
+                }
+                for r in records[:5]
+            ]
+            logger.info(
+                "Agent news cache HIT for %s (dimension=%s, records=%d)",
+                code, dimension, len(results),
+            )
+            return {
+                "query": f"cached:{dimension}",
+                "provider": "db_cache",
+                "success": True,
+                "results_count": len(results),
+                "results": results,
+                "from_cache": True,
+            }
+    except Exception as exc:
+        logger.debug("News cache lookup failed for %s: %s", stock_code, exc)
+    return None
+
+
 def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
-    """Search latest news for a stock."""
+    """Search latest news for a stock (DB-first)."""
     service = _get_search_service()
 
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
+
+    # Check DB cache first
+    cached = _load_cached_news(stock_code, "latest_news")
+    if cached:
+        return cached
 
     response = service.search_stock_news(stock_code, stock_name, max_results=5)
 
@@ -136,11 +177,14 @@ search_stock_news_tool = ToolDefinition(
 # ============================================================
 
 def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict:
-    """Multi-dimensional intelligence search."""
+    """Multi-dimensional intelligence search (DB-first for cached dimensions)."""
     service = _get_search_service()
 
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
+
+    # Quick cache check: if latest_news dimension has recent cache, use it
+    cached_latest = _load_cached_news(stock_code, "latest_news", max_age_hours=6)
 
     intel_results = service.search_comprehensive_intel(
         stock_code=stock_code,
@@ -149,6 +193,12 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
     )
 
     if not intel_results:
+        if cached_latest:
+            return {
+                "report": f"[Cached] {stock_name} recent news: {cached_latest['results_count']} articles.",
+                "dimensions": {"latest_news": cached_latest},
+                "from_cache": True,
+            }
         return {"error": "Comprehensive intel search returned no results"}
 
     # Format into readable report

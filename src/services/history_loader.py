@@ -18,6 +18,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 _CACHE_MIN_RECORDS = 30
+_MAX_STALE_TRADING_DAYS = 3
 
 # ---------------------------------------------------------------------------
 # Frozen target date (ContextVar) – set once per stock in pipeline, read by
@@ -123,6 +124,39 @@ def _select_best_bars(db, stock_code: str, start: date, end: date) -> Tuple[Opti
     return best_code, best_bars
 
 
+def _compute_missing_range(
+    bars: list, requested_start: date, requested_end: date,
+) -> Tuple[Optional[date], Optional[date]]:
+    """Return (gap_start, gap_end) for incremental fetch, or (None, None) if fully covered."""
+    if not bars:
+        return requested_start, requested_end
+
+    db_start = min(_bar_date(bar) for bar in bars)
+    db_end = max(_bar_date(bar) for bar in bars)
+
+    # Check if DB already covers the full requested range
+    gap_start = None
+    gap_end = None
+
+    if db_start > requested_start:
+        gap_start = requested_start
+    if db_end < requested_end:
+        gap_end = requested_end
+
+    # If gap is small (< _MAX_STALE_TRADING_DAYS calendar days), still consider cache hit
+    if gap_end is not None and gap_start is None:
+        # Only tail gap — check if small enough to still use cache
+        delta = (requested_end - db_end).days
+        if delta <= _MAX_STALE_TRADING_DAYS + 2:  # +2 for weekends
+            return None, None  # gap too small, use cached data as-is
+        return requested_start, requested_end
+
+    if gap_start is not None or gap_end is not None:
+        return gap_start or requested_start, gap_end or requested_end
+
+    return None, None
+
+
 def load_history_df(
     stock_code: str,
     days: int = 60,
@@ -133,6 +167,9 @@ def load_history_df(
     Returns ``(df, source)`` where *source* is ``"db_cache"`` on DB hit or the
     actual provider name on network fallback.  Returns ``(None, "none")`` when
     both paths fail.
+
+    When DB has partial coverage, only the missing date range is fetched from
+    the network (incremental sync) instead of re-pulling everything.
     """
     from src.storage import get_db
 
@@ -147,28 +184,56 @@ def load_history_df(
     start = end - timedelta(days=int(days * 1.8) + 10)
 
     # --- 1. DB lookup (canonical code, then prefix-stripped fallback) ------
-    try:
-        db = get_db()
-        _code, bars = _select_best_bars(db, stock_code, start, end)
-        required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
-        latest_date = max((_bar_date(bar) for bar in bars), default=date.min)
-        if bars and latest_date >= end and len(bars) >= required_records:
-            df = pd.DataFrame([b.to_dict() for b in bars])
-            logger.debug(
-                "load_history_df(%s): %d bars from DB (requested %d)",
-                stock_code, len(df), days,
-            )
-            return df, "db_cache"
-    except Exception as e:
-        logger.debug("load_history_df(%s): DB read failed: %s", stock_code, e)
+    db = get_db()
+    _code, db_bars = _select_best_bars(db, stock_code, start, end)
+    required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
+    db_latest = max((_bar_date(bar) for bar in db_bars), default=date.min)
 
-    # --- 2. Network fallback via singleton DataFetcherManager -------------
+    # Full cache hit: enough bars, data fresh
+    cache_fresh = db_latest >= (end - timedelta(days=_MAX_STALE_TRADING_DAYS + 2))
+    if db_bars and cache_fresh and len(db_bars) >= required_records:
+        df = pd.DataFrame([b.to_dict() for b in db_bars])
+        logger.debug("load_history_df(%s): %d bars from DB cache", stock_code, len(df))
+        return df, "db_cache"
+
+    # --- 2. Partial cache: incremental fetch for missing range ----------
+    gap_start, gap_end = _compute_missing_range(db_bars, start, end)
+    if db_bars and gap_start is None and gap_end is None:
+        # Small tail gap — use cache as-is without network call
+        df = pd.DataFrame([b.to_dict() for b in db_bars])
+        logger.debug(
+            "load_history_df(%s): %d bars from DB (small gap, using cache)",
+            stock_code, len(df),
+        )
+        return df, "db_cache"
+
+    # --- 3. Network fallback (incremental or full) -----------------------
     try:
         manager = _get_fetcher_manager()
-        df, source = manager.get_daily_data(stock_code, days=days)
+        if db_bars and gap_end is not None:
+            # Incremental: only fetch missing tail range
+            inc_days = max((gap_end - db_latest).days + 5, 30)
+            logger.info(
+                "load_history_df(%s): incremental fetch %s → %s (%d days)",
+                stock_code, db_latest, gap_end, inc_days,
+            )
+            df, source = manager.get_daily_data(
+                stock_code, start_date=db_latest.isoformat(), end_date=gap_end.isoformat(),
+                days=inc_days,
+            )
+        else:
+            # Full fetch
+            df, source = manager.get_daily_data(stock_code, days=days)
+
         if df is not None and not df.empty:
             return df, source
     except Exception as e:
         logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
+
+    # --- 4. Last resort: return whatever DB had (even if stale) ----------
+    if db_bars:
+        df = pd.DataFrame([b.to_dict() for b in db_bars])
+        logger.warning("load_history_df(%s): network failed, returning %d stale bars", stock_code, len(df))
+        return df, "db_cache_stale"
 
     return None, "none"

@@ -80,6 +80,7 @@ class PortfolioCorporateActionCreateRequest(BaseModel):
 
 class PortfolioEventCreatedResponse(BaseModel):
     id: int
+    snapshot: Optional[PortfolioSnapshotResponse] = Field(None, description="Updated snapshot when return_snapshot=true")
 
 
 class PortfolioDeleteResponse(BaseModel):
@@ -208,6 +209,7 @@ class PortfolioSnapshotResponse(BaseModel):
     tax_total: float
     fx_stale: bool
     accounts: List[PortfolioAccountSnapshot] = Field(default_factory=list)
+    risk: Optional[PortfolioRiskResponse] = Field(None, description="Risk report when include_risk=true")
 
 
 class PortfolioImportTradeItem(BaseModel):

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import Config, get_config
@@ -40,6 +40,23 @@ class PortfolioRiskService:
             as_of=as_of_date,
             cost_method=cost_method,
         )
+        return self.get_risk_report_from_snapshot(
+            snapshot=snapshot,
+            account_id=account_id,
+            as_of_date=as_of_date,
+            cost_method=cost_method,
+        )
+
+    def get_risk_report_from_snapshot(
+        self,
+        *,
+        snapshot: Dict[str, Any],
+        account_id: Optional[int] = None,
+        as_of_date: Optional[date] = None,
+        cost_method: str = "fifo",
+    ) -> Dict[str, Any]:
+        """Compute risk report from an existing snapshot, avoiding duplicate full replay."""
+        as_of_date = as_of_date or date.today()
 
         thresholds = {
             "concentration_alert_pct": float(getattr(self.config, "portfolio_risk_concentration_alert_pct", 35.0)),
@@ -74,7 +91,7 @@ class PortfolioRiskService:
         )
         stop_loss = self._build_stop_loss(snapshot, thresholds)
 
-        return {
+        result = {
             "as_of": as_of_date.isoformat(),
             "account_id": account_id,
             "cost_method": cost_method,
@@ -85,6 +102,7 @@ class PortfolioRiskService:
             "drawdown": drawdown,
             "stop_loss": stop_loss,
         }
+        return result
 
     def _ensure_drawdown_snapshot_window(
         self,
@@ -287,6 +305,12 @@ class PortfolioRiskService:
             board_cache[cache_key] = "UNCLASSIFIED"
             return board_cache[cache_key]
 
+        # ETFs/funds (5xxxxx, 1xxxxx) don't have sector classifications, skip API call
+        if symbol.isdigit() and len(symbol) == 6 and symbol[0] in ("1", "5"):
+            coverage["unclassified_count"] += 1
+            board_cache[cache_key] = "UNCLASSIFIED"
+            return board_cache[cache_key]
+
         try:
             boards = self._fetch_belong_boards(symbol)
             sector_name = self._pick_primary_board_name(boards)
@@ -340,7 +364,7 @@ class PortfolioRiskService:
         try:
             from data_provider import DataFetcherManager
 
-            self._data_manager = DataFetcherManager()
+            self._data_manager = DataFetcherManager.get_instance()
             return self._data_manager
         except Exception as exc:  # pragma: no cover - fail-open initialization
             self._data_manager_init_error = str(exc)

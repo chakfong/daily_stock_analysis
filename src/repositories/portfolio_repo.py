@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import and_, delete, desc, func, select
+from sqlalchemy import and_, delete, desc, func, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from src.storage import (
@@ -863,6 +863,132 @@ class PortfolioRepository:
     # ------------------------------------------------------------------
     # Snapshot / position cache
     # ------------------------------------------------------------------
+    def get_cached_positions_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        cost_method: str,
+    ) -> List[Dict[str, Any]]:
+        rows = session.execute(
+            select(PortfolioPosition).where(
+                and_(
+                    PortfolioPosition.account_id == account_id,
+                    PortfolioPosition.cost_method == cost_method,
+                )
+            ).order_by(PortfolioPosition.symbol.asc())
+        ).scalars().all()
+        return [
+            {
+                "symbol": row.symbol,
+                "market": row.market,
+                "currency": row.currency,
+                "quantity": float(row.quantity),
+                "avg_cost": float(row.avg_cost),
+                "total_cost": float(row.total_cost),
+                "last_price": float(row.last_price),
+                "market_value_base": float(row.market_value_base),
+                "unrealized_pnl_base": float(row.unrealized_pnl_base),
+                "valuation_currency": row.valuation_currency,
+            }
+            for row in rows
+        ]
+
+    def get_cached_lots_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        cost_method: str,
+    ) -> List[Dict[str, Any]]:
+        rows = session.execute(
+            select(PortfolioPositionLot).where(
+                and_(
+                    PortfolioPositionLot.account_id == account_id,
+                    PortfolioPositionLot.cost_method == cost_method,
+                )
+            ).order_by(
+                PortfolioPositionLot.symbol.asc(),
+                PortfolioPositionLot.open_date.asc(),
+                PortfolioPositionLot.source_trade_id.asc(),
+            )
+        ).scalars().all()
+        return [
+            {
+                "symbol": row.symbol,
+                "market": row.market,
+                "currency": row.currency,
+                "open_date": row.open_date,
+                "remaining_quantity": float(row.remaining_quantity),
+                "unit_cost": float(row.unit_cost),
+                "source_trade_id": row.source_trade_id,
+            }
+            for row in rows
+        ]
+
+    def replace_positions_and_lots_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        cost_method: str,
+        positions: Iterable[Dict[str, Any]],
+        lots: Iterable[Dict[str, Any]],
+        valuation_currency: str,
+    ) -> None:
+        """Atomically refresh position and lot cache within an existing session."""
+        session.execute(
+            delete(PortfolioPosition).where(
+                and_(
+                    PortfolioPosition.account_id == account_id,
+                    PortfolioPosition.cost_method == cost_method,
+                )
+            )
+        )
+        session.execute(
+            delete(PortfolioPositionLot).where(
+                and_(
+                    PortfolioPositionLot.account_id == account_id,
+                    PortfolioPositionLot.cost_method == cost_method,
+                )
+            )
+        )
+
+        for item in positions:
+            session.add(
+                PortfolioPosition(
+                    account_id=account_id,
+                    cost_method=cost_method,
+                    symbol=item["symbol"],
+                    market=item["market"],
+                    currency=item["currency"],
+                    quantity=float(item["quantity"]),
+                    avg_cost=float(item["avg_cost"]),
+                    total_cost=float(item["total_cost"]),
+                    last_price=float(item["last_price"]),
+                    market_value_base=float(item["market_value_base"]),
+                    unrealized_pnl_base=float(item["unrealized_pnl_base"]),
+                    valuation_currency=valuation_currency,
+                )
+            )
+
+        for lot in lots:
+            session.add(
+                PortfolioPositionLot(
+                    account_id=account_id,
+                    cost_method=cost_method,
+                    symbol=lot["symbol"],
+                    market=lot["market"],
+                    currency=lot["currency"],
+                    open_date=lot["open_date"],
+                    remaining_quantity=float(lot["remaining_quantity"]),
+                    unit_cost=float(lot["unit_cost"]),
+                    source_trade_id=lot.get("source_trade_id"),
+                )
+            )
+
+        session.flush()
+
     def replace_positions_and_lots(
         self,
         *,
@@ -1020,6 +1146,7 @@ class PortfolioRepository:
                         tax_total=tax_total,
                         fx_stale=fx_stale,
                         payload=payload,
+                        risk_payload=risk_payload,
                     )
                 )
             else:
@@ -1033,8 +1160,64 @@ class PortfolioRepository:
                 existing.tax_total = tax_total
                 existing.fx_stale = fx_stale
                 existing.payload = payload
+                if risk_payload is not None:
+                    existing.risk_payload = risk_payload
                 existing.updated_at = datetime.now()
             session.commit()
+
+    def _update_snapshot_risk(self, snapshot_id: int, risk_json: str) -> None:
+        """Update just the risk_payload field on an existing snapshot row."""
+        with self.db.get_session() as session:
+            session.execute(
+                text("""UPDATE portfolio_daily_snapshots SET risk_payload = :rp, updated_at = :now
+                   WHERE id = :id"""),
+                {"rp": risk_json, "now": datetime.now(), "id": snapshot_id},
+            )
+            session.commit()
+
+    def count_events_since(self, account_id: int, *, since: date, as_of: date) -> int:
+        """Return number of trades/cash/corporate actions between *since* and *as_of*."""
+        with self.db.get_session() as session:
+            t = session.execute(
+                select(func.count()).select_from(PortfolioTrade).where(
+                    and_(PortfolioTrade.account_id == account_id,
+                         PortfolioTrade.trade_date > since,
+                         PortfolioTrade.trade_date <= as_of)
+                )
+            ).scalar_one()
+            c = session.execute(
+                select(func.count()).select_from(PortfolioCashLedger).where(
+                    and_(PortfolioCashLedger.account_id == account_id,
+                         PortfolioCashLedger.event_date > since,
+                         PortfolioCashLedger.event_date <= as_of)
+                )
+            ).scalar_one()
+            a = session.execute(
+                select(func.count()).select_from(PortfolioCorporateAction).where(
+                    and_(PortfolioCorporateAction.account_id == account_id,
+                         PortfolioCorporateAction.effective_date > since,
+                         PortfolioCorporateAction.effective_date <= as_of)
+                )
+            ).scalar_one()
+            return int(t or 0) + int(c or 0) + int(a or 0)
+
+    def get_latest_snapshot(
+        self, *, account_id: int, as_of: date, cost_method: str,
+    ) -> Optional[PortfolioDailySnapshot]:
+        """Return the most recent snapshot row for one account/cost_method."""
+        with self.db.get_session() as session:
+            return session.execute(
+                select(PortfolioDailySnapshot)
+                .where(
+                    and_(
+                        PortfolioDailySnapshot.account_id == account_id,
+                        PortfolioDailySnapshot.snapshot_date <= as_of,
+                        PortfolioDailySnapshot.cost_method == cost_method,
+                    )
+                )
+                .order_by(PortfolioDailySnapshot.snapshot_date.desc())
+                .limit(1)
+            ).scalar_one_or_none()
 
     def replace_positions_lots_and_snapshot(
         self,
@@ -1055,6 +1238,7 @@ class PortfolioRepository:
         positions: Iterable[Dict[str, Any]],
         lots: Iterable[Dict[str, Any]],
         valuation_currency: str,
+        risk_payload: Optional[str] = None,
     ) -> None:
         """Atomically refresh position cache and daily snapshot in one transaction."""
         with self.db.get_session() as session:

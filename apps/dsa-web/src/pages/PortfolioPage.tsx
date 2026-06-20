@@ -10,6 +10,7 @@ import { PortfolioSignalSummary } from '../components/decision-signals/DecisionS
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
+import { loadStockIndex } from '../utils/stockIndexLoader';
 import type { FxRefreshFeedback } from '../utils/portfolioFormat';
 import {
   buildFxRefreshFeedback,
@@ -165,6 +166,7 @@ const PortfolioPage: React.FC = () => {
     document.title = text.documentTitle;
   }, [text.documentTitle]);
 
+  const [stockNameMap, setStockNameMap] = useState<Record<string, string>>({});
   const [accounts, setAccounts] = useState<PortfolioAccountItem[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<AccountOption>('all');
   const [showCreateAccount, setShowCreateAccount] = useState(false);
@@ -264,6 +266,24 @@ const PortfolioPage: React.FC = () => {
       ? cashEvents.length
       : corporateEvents.length;
 
+  const resolveStockName = (symbol: string): string => {
+    if (!symbol) return '';
+    // Try: 1) exact match  2) strip SH/SZ/BJ/HK prefix  3) strip .SH/.SZ suffix
+    const exact = stockNameMap[symbol];
+    if (exact) return exact;
+    const noPrefix = symbol.replace(/^(SH|SZ|BJ|HK)/, '');
+    if (noPrefix !== symbol) {
+      const name = stockNameMap[noPrefix];
+      if (name) return name;
+    }
+    const withSuffix = noPrefix + '.SH';
+    const suffixName = stockNameMap[withSuffix];
+    if (suffixName) return suffixName;
+    // Try .SZ suffix
+    const szSuffix = noPrefix + '.SZ';
+    return stockNameMap[szSuffix] || '';
+  };
+
   const isActiveRefreshContext = (requestedViewKey: string, requestedRequestId: number) => {
     return (
       refreshContextRef.current.viewKey === requestedViewKey
@@ -320,20 +340,15 @@ const PortfolioPage: React.FC = () => {
       const snapshotData = await portfolioApi.getSnapshot({
         accountId: queryAccountId,
         costMethod,
+        fast: true,  // default to cached close prices, manual refresh for realtime
+        includeRisk: true,
       });
       setSnapshot(snapshotData);
       setError(null);
-
-      try {
-        const riskData = await portfolioApi.getRisk({
-          accountId: queryAccountId,
-          costMethod,
-        });
-        setRisk(riskData);
-      } catch (riskErr) {
+      if (snapshotData.risk) {
+        setRisk(snapshotData.risk);
+      } else {
         setRisk(null);
-        const parsed = getParsedApiError(riskErr);
-        setRiskWarning(parsed.message || '风险数据获取失败，已降级为仅展示快照数据。');
       }
     } catch (err) {
       setSnapshot(null);
@@ -410,6 +425,17 @@ const PortfolioPage: React.FC = () => {
   useEffect(() => {
     void loadAccounts();
     void loadBrokers();
+    void loadStockIndex().then((result) => {
+      if (result.loaded) {
+        const map: Record<string, string> = {};
+        for (const item of result.data) {
+          // Index by displayCode (pure digits) and canonicalCode (with suffix)
+          if (item.displayCode && item.nameZh) map[item.displayCode] = item.nameZh;
+          if (item.canonicalCode && item.nameZh) map[item.canonicalCode] = item.nameZh;
+        }
+        setStockNameMap(map);
+      }
+    });
   }, [loadAccounts, loadBrokers]);
 
   useEffect(() => {
@@ -600,7 +626,7 @@ const PortfolioPage: React.FC = () => {
     }
     try {
       setWriteWarning(null);
-      await portfolioApi.createTrade({
+      const result = await portfolioApi.createTradeWithSnapshot({
         accountId: writableAccountId,
         symbol: tradeForm.symbol,
         tradeDate: tradeForm.tradeDate,
@@ -612,7 +638,38 @@ const PortfolioPage: React.FC = () => {
         tradeUid: tradeForm.tradeUid || undefined,
         note: tradeForm.note || undefined,
       });
-      await refreshPortfolioData();
+      // Update snapshot from response (single request, no separate refresh)
+      if (result.snapshot) {
+        setSnapshot(result.snapshot);
+        setError(null);
+      }
+      // Optimistic update: prepend new trade to event list
+      if (eventType === 'trade') {
+        const newTradeItem: PortfolioTradeListItem = {
+          id: result.id,
+          accountId: writableAccountId,
+          tradeUid: tradeForm.tradeUid || null,
+          symbol: tradeForm.symbol,
+          market: writableAccount?.market || 'cn',
+          currency: writableAccount?.baseCurrency || 'CNY',
+          tradeDate: tradeForm.tradeDate,
+          side: tradeForm.side,
+          quantity: Number(tradeForm.quantity),
+          price: Number(tradeForm.price),
+          fee: Number(tradeForm.fee || 0),
+          tax: Number(tradeForm.tax || 0),
+          note: tradeForm.note || null,
+          createdAt: new Date().toISOString(),
+        };
+        setTradeEvents((prev) => {
+          const updated = [newTradeItem, ...prev];
+          if (updated.length > DEFAULT_PAGE_SIZE) {
+            updated.pop();
+          }
+          return updated;
+        });
+        setEventTotal((prev) => prev + 1);
+      }
       setTradeForm((prev) => ({ ...prev, symbol: '', tradeUid: '', note: '' }));
     } catch (err) {
       setError(getParsedApiError(err));
@@ -810,7 +867,33 @@ const PortfolioPage: React.FC = () => {
   };
 
   const handleRefresh = async () => {
-    await Promise.all([loadAccounts(), loadSnapshotAndRisk(), loadEvents(), loadBrokers()]);
+    setRiskWarning(null);
+    setIsLoading(true);
+    try {
+      const [, snapshotResult] = await Promise.all([
+        loadAccounts(),
+        portfolioApi.getSnapshot({
+          accountId: queryAccountId,
+          costMethod,
+          fast: false,
+          includeRisk: true,
+        }),
+        loadEvents(),
+      ]);
+      if (snapshotResult) {
+        setSnapshot(snapshotResult);
+        if (snapshotResult.risk) {
+          setRisk(snapshotResult.risk);
+        }
+        setError(null);
+      }
+      // Avoid duplicate load of accounts/events
+      await loadBrokers();
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setIsLoading(false);
+    }
     setPortfolioSignalsRefreshKey((current) => current + 1);
   };
 
@@ -830,30 +913,19 @@ const PortfolioPage: React.FC = () => {
       const snapshotData = await portfolioApi.getSnapshot({
         accountId: requestedAccountId,
         costMethod: requestedCostMethod,
+        fast: false,
+        includeRisk: true,
       });
       if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) {
         return false;
       }
       setSnapshot(snapshotData);
       setError(null);
-
-      try {
-        const riskData = await portfolioApi.getRisk({
-          accountId: requestedAccountId,
-          costMethod: requestedCostMethod,
-        });
-        if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) {
-          return false;
-        }
-        setRisk(riskData);
+      if (snapshotData.risk) {
+        setRisk(snapshotData.risk);
         setRiskWarning(null);
-      } catch (riskErr) {
-        if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) {
-          return false;
-        }
+      } else {
         setRisk(null);
-        const parsed = getParsedApiError(riskErr);
-        setRiskWarning(parsed.message || '风险数据获取失败，已降级为仅展示快照数据。');
       }
       return true;
     } catch (err) {
@@ -1148,6 +1220,7 @@ const PortfolioPage: React.FC = () => {
                   <tr>
                     <th className="text-left py-2 pr-2">{text.account}</th>
                     <th className="text-left py-2 pr-2">{text.code}</th>
+                    <th className="text-left py-2 pr-2">名称</th>
                     <th className="text-right py-2 pr-2">{text.quantity}</th>
                     <th className="text-right py-2 pr-2">{text.avgCost}</th>
                     <th className="text-right py-2 pr-2">{text.lastPrice}</th>
@@ -1167,6 +1240,9 @@ const PortfolioPage: React.FC = () => {
                     <tr key={rowKey} className="border-b border-white/5">
                       <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
                       <td className="py-2 pr-2 font-mono text-foreground">{row.symbol}</td>
+                      <td className="py-2 pr-2 text-secondary truncate max-w-[100px]" title={resolveStockName(row.symbol)}>
+                        {resolveStockName(row.symbol)}
+                      </td>
                       <td className="py-2 pr-2 text-right">{row.quantity.toFixed(2)}</td>
                       <td className="py-2 pr-2 text-right">{row.avgCost.toFixed(4)}</td>
                       <td className="py-2 pr-2 text-right">

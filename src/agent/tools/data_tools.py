@@ -614,10 +614,48 @@ get_portfolio_snapshot_tool = ToolDefinition(
 
 
 # ============================================================
+# get_market_review
+# ============================================================
+
+def _handle_get_market_review() -> dict:
+    """Return the latest market review summary from the analysis history DB."""
+    from src.storage import get_db
+
+    db = get_db()
+    try:
+        rows, _ = db.get_analysis_history_paginated(
+            report_type="market_review", limit=1, offset=0,
+        )
+        if not rows:
+            return {"error": "No market review found in history"}
+        latest = rows[0]
+        return {
+            "created_at": latest.created_at.isoformat() if latest.created_at else "",
+            "name": latest.name or "",
+            "analysis_summary": (latest.analysis_summary or "")[:8000],
+            "sentiment_score": latest.sentiment_score,
+            "operation_advice": latest.operation_advice or "",
+        }
+    except Exception as exc:
+        return {"error": f"Failed to load market review: {exc}"}
+
+
+get_market_review_tool = ToolDefinition(
+    name="get_market_review",
+    description="Get the most recent market review (大盘复盘) summary from the analysis history. "
+                "This contains index analysis, sector rotation, sentiment assessment, "
+                "and key themes that can guide stock screening decisions.",
+    parameters=[],
+    handler=_handle_get_market_review,
+    category="data",
+)
+
+# ============================================================
 # Export all data tools
 # ============================================================
 
 ALL_DATA_TOOLS = [
+    get_market_review_tool,
     get_realtime_quote_tool,
     get_daily_history_tool,
     get_chip_distribution_tool,

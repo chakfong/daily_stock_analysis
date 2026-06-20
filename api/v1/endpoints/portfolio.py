@@ -50,6 +50,46 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _load_cached_risk(snapshot: dict, account_id: Optional[int], cost_method: str) -> Optional[dict]:
+    """Try to read cached risk from the snapshot's account-level DB rows."""
+    import json
+    from src.repositories.portfolio_repo import PortfolioRepository
+
+    accounts = snapshot.get("accounts") or []
+    if not accounts:
+        return None
+    repo = PortfolioRepository()
+    for acc in accounts:
+        aid = acc.get("account_id")
+        if aid is None:
+            continue
+        row = repo.get_latest_snapshot(account_id=int(aid), as_of=snapshot.get("as_of", ""), cost_method=cost_method)
+        if row is None or not row.risk_payload:
+            return None
+        try:
+            return json.loads(row.risk_payload) if isinstance(row.risk_payload, str) else row.risk_payload
+        except Exception:
+            return None
+    return None
+
+
+def _save_cached_risk(snapshot: dict, risk_data: dict, cost_method: str) -> None:
+    """Persist risk result alongside cached snapshot."""
+    import json
+    from src.repositories.portfolio_repo import PortfolioRepository
+
+    accounts = snapshot.get("accounts") or []
+    risk_json = json.dumps(risk_data, ensure_ascii=False, default=str)
+    repo = PortfolioRepository()
+    for acc in accounts:
+        aid = acc.get("account_id")
+        if aid is None:
+            continue
+        row = repo.get_latest_snapshot(account_id=int(aid), as_of=snapshot.get("as_of", ""), cost_method=cost_method)
+        if row is not None:
+            repo._update_snapshot_risk(row.id, risk_json)
+
+
 def _bad_request(exc: Exception) -> HTTPException:
     return api_error(400, "validation_error", str(exc))
 
@@ -166,9 +206,33 @@ def delete_account(account_id: int):
     responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
     summary="Record trade event",
 )
-def create_trade(request: PortfolioTradeCreateRequest) -> PortfolioEventCreatedResponse:
+def create_trade(
+    request: PortfolioTradeCreateRequest,
+    return_snapshot: bool = Query(False, description="Return updated portfolio snapshot in response"),
+    fast: bool = Query(True, description="Skip real-time price fetch when returning snapshot"),
+) -> PortfolioEventCreatedResponse:
     service = PortfolioService()
     try:
+        if return_snapshot:
+            data = service.record_trade_with_snapshot(
+                account_id=request.account_id,
+                symbol=request.symbol,
+                trade_date=request.trade_date,
+                side=request.side,
+                quantity=request.quantity,
+                price=request.price,
+                fee=request.fee,
+                tax=request.tax,
+                market=request.market,
+                currency=request.currency,
+                trade_uid=request.trade_uid,
+                note=request.note,
+                cost_method="fifo",
+                fast=fast,
+            )
+            response = PortfolioEventCreatedResponse(**data)
+            response.snapshot = PortfolioSnapshotResponse(**data["snapshot"])
+            return response
         data = service.record_trade(
             account_id=request.account_id,
             symbol=request.symbol,
@@ -421,6 +485,8 @@ def get_snapshot(
     account_id: Optional[int] = Query(None, description="Optional account id, default returns all accounts"),
     as_of: Optional[date] = Query(None, description="Snapshot date, default today"),
     cost_method: str = Query("fifo", description="Cost method: fifo or avg"),
+    fast: Optional[bool] = Query(None, description="None=smart(DB after 15:00), true=force cache, false=force realtime"),
+    include_risk: bool = Query(False, description="Include risk report in response (avoids duplicate snapshot)"),
 ) -> PortfolioSnapshotResponse:
     service = PortfolioService()
     try:
@@ -428,8 +494,29 @@ def get_snapshot(
             account_id=account_id,
             as_of=as_of,
             cost_method=cost_method,
+            fast=fast,
         )
-        return PortfolioSnapshotResponse(**data)
+        response = PortfolioSnapshotResponse(**data)
+
+        if include_risk:
+            # Check DB cache first — risk persists with snapshot, only recompute if missing
+            cached_risk = _load_cached_risk(data, account_id, cost_method)
+            if cached_risk is not None:
+                response.risk = PortfolioRiskResponse(**cached_risk)
+            else:
+                from src.services.portfolio_risk_service import PortfolioRiskService
+
+                risk_service = PortfolioRiskService()
+                risk_data = risk_service.get_risk_report_from_snapshot(
+                    snapshot=data,
+                    account_id=account_id,
+                    as_of_date=as_of,
+                    cost_method=cost_method,
+                )
+                response.risk = PortfolioRiskResponse(**risk_data)
+                _save_cached_risk(data, risk_data, cost_method)
+
+        return response
     except ValueError as exc:
         raise _bad_request(exc)
     except Exception as exc:

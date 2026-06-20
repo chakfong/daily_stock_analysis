@@ -7,7 +7,7 @@ import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
@@ -226,6 +226,516 @@ class PortfolioService:
                 return {"id": int(row.id)}
         except (DuplicateTradeUidError, DuplicateTradeDedupHashError) as exc:
             raise PortfolioConflictError(str(exc)) from exc
+
+    def record_trade_with_snapshot(
+        self,
+        *,
+        account_id: int,
+        symbol: str,
+        trade_date: date,
+        side: str,
+        quantity: float,
+        price: float,
+        fee: float = 0.0,
+        tax: float = 0.0,
+        market: Optional[str] = None,
+        currency: Optional[str] = None,
+        trade_uid: Optional[str] = None,
+        note: Optional[str] = None,
+        cost_method: str = "fifo",
+        fast: bool = True,
+    ) -> Dict[str, Any]:
+        """Write a trade and return an updated snapshot without full history replay.
+
+        Reads cached positions/lots from PortfolioPosition/PortfolioPositionLot tables,
+        applies the new trade incrementally, and writes back updated cache — all within
+        a single write transaction.  Falls back to full replay when the cache is empty.
+        """
+        side_norm = (side or "").strip().lower()
+        if side_norm not in VALID_SIDES:
+            raise ValueError("side must be buy or sell")
+        if quantity <= 0 or price <= 0:
+            raise ValueError("quantity and price must be > 0")
+        if fee < 0 or tax < 0:
+            raise ValueError("fee and tax must be >= 0")
+        symbol_norm = self._normalize_symbol_for_storage(symbol)
+        if not symbol_norm:
+            raise ValueError("symbol is required")
+        trade_uid_norm = (trade_uid or "").strip() or None
+        method = self._normalize_cost_method(cost_method)
+
+        with self.repo.portfolio_write_session() as session:
+            account = self._require_active_account_in_session(session=session, account_id=account_id)
+            market_norm = self._normalize_market(market or account.market)
+            currency_norm = self._normalize_currency(currency or self._default_currency_for_market(market_norm))
+            self._validate_trade_identity(
+                account_id=account_id,
+                trade_uid=trade_uid_norm,
+                dedup_hash=None,
+                session=session,
+            )
+
+            # Load cached state — fall back to full replay when cache is empty
+            cached_positions = self.repo.get_cached_positions_in_session(
+                session=session, account_id=account_id, cost_method=method,
+            )
+            cached_lots = self.repo.get_cached_lots_in_session(
+                session=session, account_id=account_id, cost_method=method,
+            )
+
+            cache_empty = len(cached_positions) == 0 and len(cached_lots) == 0
+
+            if cache_empty:
+                # First trade — build initial cache directly from this single trade
+                row = self.repo.add_trade_in_session(
+                    session=session,
+                    account_id=account_id,
+                    trade_uid=trade_uid_norm,
+                    symbol=symbol_norm,
+                    market=market_norm,
+                    currency=currency_norm,
+                    trade_date=trade_date,
+                    side=side_norm,
+                    quantity=float(quantity),
+                    price=float(price),
+                    fee=float(fee),
+                    tax=float(tax),
+                    note=(note or "").strip() or None,
+                    dedup_hash=None,
+                )
+                trade_id = int(row.id)
+
+                # Build initial position from this single trade
+                if side_norm == "buy":
+                    gross = float(quantity) * float(price)
+                    total_cost = gross + float(fee) + float(tax)
+                    unit_cost = total_cost / float(quantity)
+                    close_info = self.repo.get_latest_close_with_date(
+                        symbol=symbol_norm, as_of=trade_date,
+                    )
+                    last_price = float(close_info[0]) if close_info and close_info[0] > 0 else 0.0
+                    market_value = float(quantity) * last_price
+                    unrealized = market_value - total_cost
+
+                    cached_positions.append({
+                        "symbol": self._normalize_symbol_for_position(symbol),
+                        "market": market_norm,
+                        "currency": currency_norm,
+                        "quantity": float(quantity),
+                        "avg_cost": unit_cost,
+                        "total_cost": total_cost,
+                        "last_price": last_price,
+                        "market_value_base": market_value,
+                        "unrealized_pnl_base": unrealized,
+                        "unrealized_pnl_pct": (unrealized / total_cost * 100.0) if abs(total_cost) > EPS and last_price > 0 else None,
+                        "valuation_currency": account.base_currency,
+                        "price_source": "history_close" if close_info else "missing",
+                        "price_available": bool(close_info and close_info[0] > 0),
+                        "price_date": close_info[1].isoformat() if close_info else None,
+                        "price_provider": None,
+                    })
+
+                    if method == "fifo":
+                        cached_lots.append({
+                            "symbol": self._normalize_symbol_for_position(symbol),
+                            "market": market_norm,
+                            "currency": currency_norm,
+                            "open_date": trade_date,
+                            "remaining_quantity": float(quantity),
+                            "unit_cost": unit_cost,
+                            "source_trade_id": trade_id,
+                        })
+
+                # Write initial cache so subsequent calls use incremental path
+                self.repo.replace_positions_and_lots_in_session(
+                    session=session,
+                    account_id=account_id,
+                    cost_method=method,
+                    positions=cached_positions,
+                    lots=cached_lots,
+                    valuation_currency=account.base_currency,
+                )
+            else:
+                # Sell-side validation against cached state
+                if side_norm == "sell":
+                    pos_key = (
+                        self._normalize_symbol_for_position(symbol),
+                        market_norm,
+                        currency_norm,
+                    )
+                    available_qty = self._get_cached_quantity(
+                        cached_positions, cached_lots, pos_key, method,
+                    )
+                    if available_qty + EPS < float(quantity):
+                        raise PortfolioOversellError(
+                            symbol=pos_key[0],
+                            trade_date=trade_date,
+                            requested_quantity=float(quantity),
+                            available_quantity=available_qty,
+                        )
+
+                # Insert trade row (without invalidating cache)
+                trade_row = self.repo.add_trade_in_session(
+                    session=session,
+                    account_id=account_id,
+                    trade_uid=trade_uid_norm,
+                    symbol=symbol_norm,
+                    market=market_norm,
+                    currency=currency_norm,
+                    trade_date=trade_date,
+                    side=side_norm,
+                    quantity=float(quantity),
+                    price=float(price),
+                    fee=float(fee),
+                    tax=float(tax),
+                    note=(note or "").strip() or None,
+                    dedup_hash=None,
+                )
+                trade_id = int(trade_row.id)
+
+                # Apply incremental change
+                self._apply_trade_incremental(
+                    positions=cached_positions,
+                    lots=cached_lots,
+                    symbol=symbol_norm,
+                    market=market_norm,
+                    currency=currency_norm,
+                    side=side_norm,
+                    quantity=float(quantity),
+                    price=float(price),
+                    fee=float(fee),
+                    tax=float(tax),
+                    trade_date=trade_date,
+                    cost_method=method,
+                    trade_id=trade_id,
+                )
+
+                # Refresh prices from DB cache (no external API in fast mode)
+                for pos in cached_positions:
+                    close_info = self.repo.get_latest_close_with_date(
+                        symbol=pos["symbol"], as_of=trade_date,
+                    )
+                    if close_info is not None and close_info[0] > 0:
+                        pos["last_price"] = float(close_info[0])
+                        pos["price_date"] = close_info[1].isoformat()
+                        pos["price_source"] = "history_close"
+                        pos["price_available"] = True
+                    else:
+                        pos["price_source"] = "missing"
+                        pos["price_available"] = False
+
+                    pos["market_value_base"] = pos["quantity"] * pos["last_price"]
+                    pos["unrealized_pnl_base"] = pos["market_value_base"] - pos["total_cost"]
+                    if abs(pos["total_cost"]) > EPS:
+                        pos["unrealized_pnl_pct"] = pos["unrealized_pnl_base"] / pos["total_cost"] * 100.0
+                    else:
+                        pos["unrealized_pnl_pct"] = None
+
+                # Write back updated cache atomically
+                self.repo.replace_positions_and_lots_in_session(
+                    session=session,
+                    account_id=account_id,
+                    cost_method=method,
+                    positions=cached_positions,
+                    lots=cached_lots,
+                    valuation_currency=account.base_currency,
+                )
+
+            # Build snapshot from cache state
+            snapshot = self._build_snapshot_from_cache(
+                account=account,
+                positions=cached_positions,
+                lots=cached_lots,
+                cost_method=method,
+                trade_date=trade_date,
+            )
+
+            return {
+                "id": trade_id,
+                "snapshot": snapshot,
+            }
+
+    def _apply_trade_incremental(
+        self,
+        *,
+        positions: List[Dict[str, Any]],
+        lots: List[Dict[str, Any]],
+        symbol: str,
+        market: str,
+        currency: str,
+        side: str,
+        quantity: float,
+        price: float,
+        fee: float,
+        tax: float,
+        trade_date: date,
+        cost_method: str,
+        trade_id: int,
+    ) -> None:
+        """Mutate *positions* and *lots* lists in-place for a single trade."""
+        pos_key = (
+            self._normalize_symbol_for_position(symbol),
+            market,
+            currency,
+        )
+
+        if side == "buy":
+            gross = quantity * price
+            total_cost_increment = gross + fee + tax
+
+            if cost_method == "fifo":
+                unit_cost = total_cost_increment / quantity
+                lots.append({
+                    "symbol": pos_key[0],
+                    "market": pos_key[1],
+                    "currency": pos_key[2],
+                    "open_date": trade_date,
+                    "remaining_quantity": quantity,
+                    "unit_cost": unit_cost,
+                    "source_trade_id": trade_id,
+                })
+                # Also update position entry for FIFO
+                matching = [p for p in positions
+                            if p["symbol"] == pos_key[0]
+                            and p["market"] == pos_key[1]
+                            and p["currency"] == pos_key[2]]
+                if matching:
+                    pos = matching[0]
+                    pos["total_cost"] = pos["total_cost"] + total_cost_increment
+                    pos["quantity"] = pos["quantity"] + quantity
+                    pos["avg_cost"] = pos["total_cost"] / pos["quantity"]
+                else:
+                    positions.append({
+                        "symbol": pos_key[0],
+                        "market": pos_key[1],
+                        "currency": pos_key[2],
+                        "quantity": quantity,
+                        "avg_cost": unit_cost,
+                        "total_cost": total_cost_increment,
+                        "last_price": 0.0,
+                        "market_value_base": 0.0,
+                        "unrealized_pnl_base": 0.0,
+                        "unrealized_pnl_pct": None,
+                        "valuation_currency": currency,
+                        "price_source": "missing",
+                        "price_available": False,
+                        "price_date": None,
+                    })
+            else:
+                # AVG: update or create position entry
+                matching = [p for p in positions
+                            if p["symbol"] == pos_key[0]
+                            and p["market"] == pos_key[1]
+                            and p["currency"] == pos_key[2]]
+                if matching:
+                    pos = matching[0]
+                    pos["total_cost"] = pos["total_cost"] + total_cost_increment
+                    pos["quantity"] = pos["quantity"] + quantity
+                    pos["avg_cost"] = pos["total_cost"] / pos["quantity"]
+                else:
+                    unit_cost = total_cost_increment / quantity
+                    positions.append({
+                        "symbol": pos_key[0],
+                        "market": pos_key[1],
+                        "currency": pos_key[2],
+                        "quantity": quantity,
+                        "avg_cost": unit_cost,
+                        "total_cost": total_cost_increment,
+                        "last_price": 0.0,
+                        "market_value_base": 0.0,
+                        "unrealized_pnl_base": 0.0,
+                        "unrealized_pnl_pct": None,
+                        "valuation_currency": currency,
+                        "price_source": "missing",
+                        "price_available": False,
+                        "price_date": None,
+                    })
+
+        else:  # sell
+            if cost_method == "fifo":
+                # Consume from FIFO lots (mutates lots list)
+                symbol_lots = [lot for lot in lots
+                               if lot["symbol"] == pos_key[0]
+                               and lot["market"] == pos_key[1]
+                               and lot["currency"] == pos_key[2]]
+                # Remove symbol lots from main list, will add back remaining
+                lots[:] = [lot for lot in lots
+                           if not (lot["symbol"] == pos_key[0]
+                                   and lot["market"] == pos_key[1]
+                                   and lot["currency"] == pos_key[2])]
+                cost_basis = self._consume_fifo_lots(symbol_lots, quantity, symbol, trade_date)
+                # Add back remaining lots (not fully consumed)
+                lots.extend([lot for lot in symbol_lots if lot["remaining_quantity"] > EPS])
+                # Update position entry for FIFO sell
+                matching = [p for p in positions
+                            if p["symbol"] == pos_key[0]
+                            and p["market"] == pos_key[1]
+                            and p["currency"] == pos_key[2]]
+                if matching:
+                    pos = matching[0]
+                    pos["quantity"] -= quantity
+                    pos["total_cost"] -= cost_basis
+                    if pos["quantity"] <= EPS:
+                        pos["quantity"] = 0.0
+                        pos["total_cost"] = 0.0
+                        pos["avg_cost"] = 0.0
+                    else:
+                        pos["avg_cost"] = pos["total_cost"] / pos["quantity"]
+            else:
+                # AVG: reduce position
+                matching = [p for p in positions
+                            if p["symbol"] == pos_key[0]
+                            and p["market"] == pos_key[1]
+                            and p["currency"] == pos_key[2]]
+                if not matching:
+                    raise PortfolioOversellError(
+                        symbol=symbol, trade_date=trade_date,
+                        requested_quantity=quantity, available_quantity=0.0,
+                    )
+                pos = matching[0]
+                if pos["quantity"] < quantity - EPS:
+                    raise PortfolioOversellError(
+                        symbol=symbol, trade_date=trade_date,
+                        requested_quantity=quantity, available_quantity=pos["quantity"],
+                    )
+                avg_cost = pos["total_cost"] / pos["quantity"] if pos["quantity"] > EPS else 0.0
+                cost_basis = avg_cost * quantity
+                pos["quantity"] -= quantity
+                pos["total_cost"] -= cost_basis
+                if pos["quantity"] <= EPS:
+                    pos["quantity"] = 0.0
+                    pos["total_cost"] = 0.0
+                    pos["avg_cost"] = 0.0
+                else:
+                    pos["avg_cost"] = pos["total_cost"] / pos["quantity"]
+
+    @staticmethod
+    def _get_cached_quantity(
+        positions: List[Dict[str, Any]],
+        lots: List[Dict[str, Any]],
+        key: Tuple[str, str, str],
+        cost_method: str,
+    ) -> float:
+        """Return total held quantity for *key* from cached state."""
+        if cost_method == "fifo":
+            return sum(
+                float(lot["remaining_quantity"])
+                for lot in lots
+                if lot["symbol"] == key[0]
+                and lot["market"] == key[1]
+                and lot["currency"] == key[2]
+            )
+        for pos in positions:
+            if pos["symbol"] == key[0] and pos["market"] == key[1] and pos["currency"] == key[2]:
+                return float(pos["quantity"])
+        return 0.0
+
+    def _build_snapshot_from_cache(
+        self,
+        *,
+        account: Any,
+        positions: List[Dict[str, Any]],
+        lots: List[Dict[str, Any]],
+        cost_method: str,
+        trade_date: date,
+    ) -> Dict[str, Any]:
+        """Build a snapshot response dict from cached positions/lots."""
+        total_market_value = sum(float(p.get("market_value_base", 0.0) or 0.0) for p in positions)
+        total_cost = sum(float(p.get("total_cost", 0.0) or 0.0) for p in positions)
+        unrealized_pnl = total_market_value - total_cost
+
+        position_rows = []
+        for pos in positions:
+            qty = float(pos["quantity"])
+            if qty <= EPS:
+                continue
+            avg_cost = float(pos["avg_cost"])
+            last_price = float(pos.get("last_price", 0.0) or 0.0)
+            unrealized_pnl_pct = None
+            if abs(avg_cost) > EPS and last_price > 0:
+                unrealized_pnl_pct = (last_price - avg_cost) / avg_cost * 100.0
+
+            position_rows.append({
+                "symbol": pos["symbol"],
+                "market": pos["market"],
+                "currency": pos["currency"],
+                "quantity": round(qty, 8),
+                "avg_cost": round(avg_cost, 8),
+                "total_cost": round(float(pos["total_cost"]), 8),
+                "last_price": round(last_price, 8),
+                "market_value_base": round(float(pos.get("market_value_base", 0.0) or 0.0), 8),
+                "unrealized_pnl_base": round(float(pos.get("unrealized_pnl_base", 0.0) or 0.0), 8),
+                "unrealized_pnl_pct": round(unrealized_pnl_pct, 8) if unrealized_pnl_pct is not None else None,
+                "valuation_currency": pos.get("valuation_currency", account.base_currency),
+                "price_source": pos.get("price_source", "missing"),
+                "price_provider": pos.get("price_provider"),
+                "price_date": pos.get("price_date"),
+                "price_stale": False,
+                "price_available": bool(pos.get("price_available", False)),
+            })
+
+        # Calculate realized PnL and fees/taxes for snapshot — use simple aggregate from existing trades
+        # For incremental mode we build a reasonable approximation from the event list
+        trades_all = self.repo.list_trades(account.id, as_of=trade_date)
+        fee_total = sum(float(t.fee or 0.0) for t in trades_all)
+        tax_total = sum(float(t.tax or 0.0) for t in trades_all)
+
+        # Total cash requires replaying cash events — use simplified approach:
+        # Load cash ledger events and sum them up
+        cash_ledger = self.repo.list_cash_ledger(account.id, as_of=trade_date)
+        cash_balance = 0.0
+        for c in cash_ledger:
+            amount = float(c.amount or 0.0)
+            if c.direction == "in":
+                cash_balance += amount
+            elif c.direction == "out":
+                cash_balance -= amount
+
+        # Subtract trade gross amounts
+        for t in trades_all:
+            gross = float(t.quantity or 0.0) * float(t.price or 0.0)
+            if t.side == "buy":
+                cash_balance -= (gross + float(t.fee or 0.0) + float(t.tax or 0.0))
+            elif t.side == "sell":
+                cash_balance += (gross - float(t.fee or 0.0) - float(t.tax or 0.0))
+
+        total_equity = cash_balance + total_market_value
+
+        account_payload = {
+            "account_id": account.id,
+            "account_name": account.name,
+            "owner_id": account.owner_id,
+            "broker": account.broker,
+            "market": account.market,
+            "base_currency": account.base_currency,
+            "as_of": trade_date.isoformat(),
+            "cost_method": cost_method,
+            "total_cash": round(cash_balance, 6),
+            "total_market_value": round(total_market_value, 6),
+            "total_equity": round(total_equity, 6),
+            "realized_pnl": 0.0,
+            "unrealized_pnl": round(unrealized_pnl, 6),
+            "fee_total": round(fee_total, 6),
+            "tax_total": round(tax_total, 6),
+            "fx_stale": False,
+            "positions": position_rows,
+        }
+
+        return {
+            "as_of": trade_date.isoformat(),
+            "cost_method": cost_method,
+            "currency": account.base_currency,
+            "account_count": 1,
+            "total_cash": round(cash_balance, 6),
+            "total_market_value": round(total_market_value, 6),
+            "total_equity": round(total_equity, 6),
+            "realized_pnl": 0.0,
+            "unrealized_pnl": round(unrealized_pnl, 6),
+            "fee_total": round(fee_total, 6),
+            "tax_total": round(tax_total, 6),
+            "fx_stale": False,
+            "accounts": [account_payload],
+        }
 
     def record_cash_ledger(
         self,
@@ -448,6 +958,7 @@ class PortfolioService:
         account_id: Optional[int] = None,
         as_of: Optional[date] = None,
         cost_method: str = "fifo",
+        fast: Optional[bool] = None,
     ) -> Dict[str, Any]:
         as_of_date = as_of or date.today()
         method = self._normalize_cost_method(cost_method)
@@ -457,6 +968,17 @@ class PortfolioService:
             account_rows = [account]
         else:
             account_rows = self.repo.list_accounts(include_inactive=False)
+
+        # Fast path: if a recent cached snapshot exists for ALL accounts, return it
+        # Only use cache when fast=True or fast=None (smart mode). fast=False needs fresh realtime.
+        if fast is not False:
+            cached = self._load_cached_snapshot(
+                account_ids=[a.id for a in account_rows],
+                as_of_date=as_of_date,
+                cost_method=method,
+            )
+            if cached is not None:
+                return cached
 
         accounts_payload: List[Dict[str, Any]] = []
         aggregate_currency = "CNY"
@@ -472,7 +994,17 @@ class PortfolioService:
         }
 
         for account in account_rows:
-            account_snapshot = self._replay_account(account=account, as_of_date=as_of_date, cost_method=method)
+            # Skip replay if cached snapshot has no changes since last computed (only when cache is acceptable)
+            cached_row = self.repo.get_latest_snapshot(account_id=account.id, as_of=as_of_date, cost_method=method)
+            if fast is not False and cached_row is not None and cached_row.snapshot_date == as_of_date:
+                new_events = self.repo.count_events_since(account.id, since=cached_row.snapshot_date, as_of=as_of_date)
+                if new_events == 0:
+                    payload = json.loads(cached_row.payload) if isinstance(cached_row.payload, str) else cached_row.payload
+                    accounts_payload.append(payload)
+                    aggregate = self._accumulate_aggregate(aggregate, payload, account.base_currency, as_of_date, aggregate_currency)
+                    continue
+
+            account_snapshot = self._replay_account(account=account, as_of_date=as_of_date, cost_method=method, fast=fast)
 
             self.repo.replace_positions_lots_and_snapshot(
                 account_id=account.id,
@@ -735,7 +1267,7 @@ class PortfolioService:
 
         return quantity_held
 
-    def _replay_account(self, *, account: Any, as_of_date: date, cost_method: str) -> Dict[str, Any]:
+    def _replay_account(self, *, account: Any, as_of_date: date, cost_method: str, fast: bool = False) -> Dict[str, Any]:
         trades = self.repo.list_trades(account.id, as_of=as_of_date)
         cash_ledger = self.repo.list_cash_ledger(account.id, as_of=as_of_date)
         corporate_actions = self.repo.list_corporate_actions(account.id, as_of=as_of_date)
@@ -894,6 +1426,7 @@ class PortfolioService:
             cost_method=cost_method,
             fifo_lots=fifo_lots,
             avg_state=avg_state,
+            fast=fast,
         )
         fx_stale = fx_stale or stale_pos
 
@@ -954,6 +1487,7 @@ class PortfolioService:
         cost_method: str,
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]],
         avg_state: Dict[Tuple[str, str, str], _AvgState],
+        fast: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, float, bool]:
         position_rows: List[Dict[str, Any]] = []
         lot_rows: List[Dict[str, Any]] = []
@@ -997,7 +1531,7 @@ class PortfolioService:
                     }
                 )
 
-            price_info = self._resolve_position_price(symbol=symbol, as_of_date=as_of_date)
+            price_info = self._resolve_position_price(symbol=symbol, as_of_date=as_of_date, fast=fast)
             last_price = price_info.price
 
             if price_info.is_available:
@@ -1051,8 +1585,40 @@ class PortfolioService:
 
         return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
 
-    def _resolve_position_price(self, *, symbol: str, as_of_date: date) -> _ResolvedPositionPrice:
+    def _resolve_position_price(self, *, symbol: str, as_of_date: date, fast: Optional[bool] = None) -> _ResolvedPositionPrice:
+        """Resolve position price with optional cache policy.
+
+        fast=None (default): smart — use DB cache after market close (>=15:00)
+        fast=True: force DB cache, skip all external calls
+        fast=False: always try realtime first, fallback to DB
+        """
         today = date.today()
+
+        # fast=True: always force cache
+        if fast:
+            close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=today)
+            if close is not None and close[0] > 0:
+                return _ResolvedPositionPrice(
+                    price=float(close[0]), source="history_close",
+                    price_date=close[1], is_stale=close[1] < today, is_available=True,
+                )
+            return _ResolvedPositionPrice(price=0.0, source="missing", price_date=None, is_stale=True, is_available=False)
+
+        # fast=None (smart): check if DB close is fresh enough
+        smart_mode = fast is None
+
+        if smart_mode or as_of_date != today:
+            close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=today)
+            if close is not None and close[0] > 0:
+                close_price, close_date = close
+                if not smart_mode or (smart_mode and datetime.now().hour >= 15 and close_date == today):
+                    return _ResolvedPositionPrice(
+                        price=float(close_price),
+                        source="history_close",
+                        price_date=close_date,
+                        is_stale=close_date < today,
+                        is_available=True,
+                    )
 
         if as_of_date == today:
             realtime_price, provider = self._fetch_realtime_position_price(symbol)
@@ -1091,7 +1657,7 @@ class PortfolioService:
         try:
             from data_provider.base import DataFetcherManager
 
-            quote = DataFetcherManager().get_realtime_quote(symbol, log_final_failure=False)
+            quote = DataFetcherManager.get_instance().get_realtime_quote(symbol, log_final_failure=False)
         except Exception as exc:
             logger.warning("Failed to fetch realtime portfolio price for %s: %s", symbol, exc)
             return None, None
@@ -1579,6 +2145,65 @@ class PortfolioService:
         if page_size < 1 or page_size > 100:
             raise ValueError("page_size must be in [1, 100]")
         return page, page_size
+
+    def _load_cached_snapshot(
+        self, *, account_ids: List[int], as_of_date: date, cost_method: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return full snapshot from DB cache if all accounts have a valid cached snapshot."""
+        if not account_ids:
+            return None
+        accounts_payload = []
+        aggregate = {
+            "total_cash": 0.0, "total_market_value": 0.0, "total_equity": 0.0,
+            "realized_pnl": 0.0, "unrealized_pnl": 0.0,
+            "fee_total": 0.0, "tax_total": 0.0, "fx_stale": False,
+        }
+        for aid in account_ids:
+            row = self.repo.get_latest_snapshot(account_id=aid, as_of=as_of_date, cost_method=cost_method)
+            if row is None or row.snapshot_date != as_of_date:
+                return None
+            payload = json.loads(row.payload) if isinstance(row.payload, str) else row.payload
+            accounts_payload.append(payload)
+            aggregate["total_cash"] += float(payload.get("total_cash", 0))
+            aggregate["total_market_value"] += float(payload.get("total_market_value", 0))
+            aggregate["total_equity"] += float(payload.get("total_equity", 0))
+            aggregate["realized_pnl"] += float(payload.get("realized_pnl", 0))
+            aggregate["unrealized_pnl"] += float(payload.get("unrealized_pnl", 0))
+            aggregate["fee_total"] += float(payload.get("fee_total", 0))
+            aggregate["tax_total"] += float(payload.get("tax_total", 0))
+            aggregate["fx_stale"] = aggregate["fx_stale"] or bool(payload.get("fx_stale"))
+        aggregate_currency = accounts_payload[0].get("base_currency", "CNY")
+        return {
+            "as_of": as_of_date.isoformat(),
+            "cost_method": cost_method,
+            "currency": aggregate_currency,
+            "account_count": len(account_ids),
+            "total_cash": round(aggregate["total_cash"], 6),
+            "total_market_value": round(aggregate["total_market_value"], 6),
+            "total_equity": round(aggregate["total_equity"], 6),
+            "realized_pnl": round(aggregate["realized_pnl"], 6),
+            "unrealized_pnl": round(aggregate["unrealized_pnl"], 6),
+            "fee_total": round(aggregate["fee_total"], 6),
+            "tax_total": round(aggregate["tax_total"], 6),
+            "fx_stale": aggregate["fx_stale"],
+            "accounts": accounts_payload,
+        }
+
+    def _accumulate_aggregate(
+        self, agg: dict, payload: dict, base_currency: str, as_of_date: date, target_currency: str,
+    ) -> dict:
+        """Accumulate one account's payload into the aggregate totals."""
+        for field in ["total_cash", "total_market_value", "total_equity",
+                       "realized_pnl", "unrealized_pnl", "fee_total", "tax_total"]:
+            amount = float(payload.get(field, 0))
+            converted, stale, _ = self._convert_amount(
+                amount=amount, from_currency=base_currency,
+                to_currency=target_currency, as_of_date=as_of_date,
+            )
+            agg[field] += converted
+            if field == "total_cash":
+                agg["fx_stale"] = agg["fx_stale"] or stale
+        return agg
 
     @staticmethod
     def _normalize_market(value: str) -> str:

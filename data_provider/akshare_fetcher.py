@@ -1370,7 +1370,12 @@ class AkshareFetcher(BaseFetcher):
         import akshare as ak
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_etf"
-        
+
+        # Bail early if ETF endpoint is known-broken
+        if not circuit_breaker.is_available(source_key):
+            logger.info("[实时行情] ETF 接口熔断中，跳过 akshare ETF 数据源")
+            return None
+
         try:
             # 检查缓存
             current_time = time.time()

@@ -86,6 +86,7 @@ export interface PortfolioSnapshotResponse {
   taxTotal: number;
   fxStale: boolean;
   accounts: PortfolioAccountSnapshot[];
+  risk?: PortfolioRiskResponse | null;
 }
 
 export interface PortfolioConcentrationItem {
@@ -188,6 +189,7 @@ export interface PortfolioCorporateActionCreateRequest {
 
 export interface PortfolioEventCreatedResponse {
   id: number;
+  snapshot?: PortfolioSnapshotResponse | null;
 }
 
 export interface PortfolioDeleteResponse {

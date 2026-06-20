@@ -588,10 +588,32 @@ class DataFetcherManager:
     }
     _daily_source_health = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
 
+    _instance: Optional['DataFetcherManager'] = None
+    _instance_lock = RLock()
+
+    @classmethod
+    def get_instance(cls) -> 'DataFetcherManager':
+        """Return the shared singleton DataFetcherManager.
+
+        Avoids repeated Tushare API initialization (~2 s each) and re-creates
+        circuit-breaker state across the same process.
+        """
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Clear the singleton (for tests that need clean state)."""
+        with cls._instance_lock:
+            cls._instance = None
+
     def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
         """
         初始化管理器
-        
+
         Args:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
@@ -1632,7 +1654,7 @@ class DataFetcherManager:
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
 
-        from .akshare_fetcher import _is_us_code
+        from .akshare_fetcher import _is_etf_code, _is_us_code
         from .us_index_mapping import is_us_index_code
         from src.config import get_config
 
@@ -1785,6 +1807,15 @@ class DataFetcherManager:
                             return self._enrich_realtime_quote(
                                 primary_quote,
                                 fallback_from=primary_fallback_from,
+                                realtime_cache_ttl=getattr(config, "realtime_cache_ttl", None),
+                            )
+                        # ETF: tushare already returns sufficient data; skip supplement
+                        # entirely. Fileding volume_ratio/circ_mv/amplitude doesn't
+                        # apply to ETFs and the Akshare ETF endpoint is unreliable.
+                        if _is_etf_code(stock_code):
+                            logger.info("[实时行情] %s ETF 不需补充字段，直接返回", stock_code)
+                            return self._enrich_realtime_quote(
+                                primary_quote, fallback_from=primary_fallback_from,
                                 realtime_cache_ttl=getattr(config, "realtime_cache_ttl", None),
                             )
                         # Otherwise, continue to try later sources for missing fields
@@ -2089,7 +2120,18 @@ class DataFetcherManager:
                 circuit_breaker.record_failure(source_key, str(e))
                 continue
 
-        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
+        # --- Ultimate fallback: local CYQ calculation from cached K-line data ---
+        try:
+            from src.services.cyq_calculator import calculate_cyq_from_db
+
+            chip = calculate_cyq_from_db(stock_code)
+            if chip is not None and _is_meaningful_chip_distribution(chip):
+                logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: local_cyq)")
+                return chip
+        except Exception as exc:
+            logger.warning(f"[筹码分布] local_cyq {stock_code} 失败: {exc}")
+
+        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败 (含本地计算)")
         return None
 
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:

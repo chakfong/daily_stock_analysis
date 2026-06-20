@@ -27,6 +27,8 @@ type SnapshotQuery = {
   accountId?: number;
   asOf?: string;
   costMethod?: PortfolioCostMethod;
+  fast?: boolean;
+  includeRisk?: boolean;
 };
 
 type FxRefreshQuery = {
@@ -56,8 +58,8 @@ type CorporateListQuery = EventQuery & {
   actionType?: 'cash_dividend' | 'split_adjustment';
 };
 
-function buildSnapshotParams(query: SnapshotQuery): Record<string, string | number> {
-  const params: Record<string, string | number> = {};
+function buildSnapshotParams(query: SnapshotQuery): Record<string, string | number | boolean> {
+  const params: Record<string, string | number | boolean> = {};
   if (query.accountId != null) {
     params.account_id = query.accountId;
   }
@@ -66,6 +68,12 @@ function buildSnapshotParams(query: SnapshotQuery): Record<string, string | numb
   }
   if (query.costMethod) {
     params.cost_method = query.costMethod;
+  }
+  if (query.fast !== undefined) {
+    params.fast = query.fast;
+  }
+  if (query.includeRisk !== undefined) {
+    params.include_risk = query.includeRisk;
   }
   return params;
 }
@@ -172,6 +180,29 @@ export const portfolioApi = {
       currency: payload.currency,
       trade_uid: payload.tradeUid,
       note: payload.note,
+    });
+    return toCamelCase<PortfolioEventCreatedResponse>(response.data);
+  },
+
+  async createTradeWithSnapshot(payload: PortfolioTradeCreateRequest): Promise<PortfolioEventCreatedResponse> {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/portfolio/trades', {
+      account_id: payload.accountId,
+      symbol: payload.symbol,
+      trade_date: payload.tradeDate,
+      side: payload.side,
+      quantity: payload.quantity,
+      price: payload.price,
+      fee: payload.fee ?? 0,
+      tax: payload.tax ?? 0,
+      market: payload.market,
+      currency: payload.currency,
+      trade_uid: payload.tradeUid,
+      note: payload.note,
+    }, {
+      params: {
+        return_snapshot: true,
+        fast: true,
+      },
     });
     return toCamelCase<PortfolioEventCreatedResponse>(response.data);
   },

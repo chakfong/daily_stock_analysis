@@ -126,7 +126,8 @@ class StockDaily(Base):
     ma10 = Column(Float)
     ma20 = Column(Float)
     volume_ratio = Column(Float)  # 量比
-    
+    turnover_rate = Column(Float)  # 换手率（%）
+
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
     
@@ -159,6 +160,7 @@ class StockDaily(Base):
             'ma10': self.ma10,
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
+            'turnover_rate': self.turnover_rate,
             'data_source': self.data_source,
         }
 
@@ -644,6 +646,7 @@ class PortfolioDailySnapshot(Base):
     tax_total = Column(Float, nullable=False, default=0.0)
     fx_stale = Column(Boolean, nullable=False, default=False)
     payload = Column(Text)
+    risk_payload = Column(Text)
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -1601,6 +1604,41 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         return saved_count
 
+    def get_recent_news_intel(
+        self, *, code: str, dimension: str, max_age_hours: int = 24,
+    ) -> List[Dict[str, Any]]:
+        """Return cached news records matching code+dimension within the age window.
+
+        Returns records ordered by fetched_at descending (most recent first).
+        """
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        try:
+            with self.get_session() as session:
+                rows = session.execute(
+                    select(NewsIntel)
+                    .where(
+                        and_(
+                            NewsIntel.code == code,
+                            NewsIntel.dimension == dimension,
+                            NewsIntel.fetched_at >= cutoff,
+                        ),
+                    )
+                    .order_by(NewsIntel.fetched_at.desc())
+                    .limit(20)
+                ).scalars().all()
+                return [
+                    {
+                        "title": r.title,
+                        "snippet": r.snippet,
+                        "url": r.url,
+                        "source": r.source,
+                        "published_date": r.published_date.isoformat() if r.published_date else "",
+                    }
+                    for r in rows
+                ]
+        except Exception:
+            return []
+
     def save_fundamental_snapshot(
         self,
         query_id: str,
@@ -2245,6 +2283,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 'volume': self._normalize_sql_value(row.get('volume')),
                 'amount': self._normalize_sql_value(row.get('amount')),
                 'pct_chg': self._normalize_sql_value(row.get('pct_chg')),
+                'turnover_rate': self._normalize_sql_value(row.get('turnover_rate')),
                 'ma5': self._normalize_sql_value(row.get('ma5')),
                 'ma10': self._normalize_sql_value(row.get('ma10')),
                 'ma20': self._normalize_sql_value(row.get('ma20')),
